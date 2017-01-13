@@ -190,7 +190,7 @@ mwifiex_11n_aggregate_pkt(struct mwifiex_private *priv,
 				       ra_list_flags);
 		return -1;
 	}
-	skb_reserve(skb_aggr, MWIFIEX_MIN_DATA_HEADER_LEN);
+
 	tx_info_aggr =  MWIFIEX_SKB_TXCB(skb_aggr);
 
 	memset(tx_info_aggr, 0, sizeof(*tx_info_aggr));
