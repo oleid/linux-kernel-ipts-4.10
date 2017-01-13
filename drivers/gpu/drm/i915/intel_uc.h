@@ -158,6 +158,7 @@ struct intel_guc {
 	struct ida ctx_ids;
 
 	struct i915_guc_client *execbuf_client;
+	struct i915_guc_client *ipts_client;
 
 	DECLARE_BITMAP(doorbell_bitmap, GUC_MAX_DOORBELLS);
 	uint32_t db_cacheline;		/* Cyclic counter mod pagesize	*/
@@ -212,6 +213,12 @@ struct i915_vma *intel_guc_allocate_vma(struct intel_guc *guc, u32 size);
 void intel_guc_log_create(struct intel_guc *guc);
 void i915_guc_log_register(struct drm_i915_private *dev_priv);
 void i915_guc_log_unregister(struct drm_i915_private *dev_priv);
+int i915_guc_ipts_submission_enable(struct drm_i915_private *dev_priv,
+				    struct i915_gem_context *ctx);
+void i915_guc_ipts_submission_disable(struct drm_i915_private *dev_priv);
+void i915_guc_ipts_reacquire_doorbell(struct drm_i915_private *dev_priv);
+void i915_guc_capture_logs(struct drm_i915_private *dev_priv);
+void i915_guc_flush_logs(struct drm_i915_private *dev_priv);
 int i915_guc_log_control(struct drm_i915_private *dev_priv, u64 control_val);
 
 static inline u32 guc_ggtt_offset(struct i915_vma *vma)

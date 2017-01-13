@@ -117,6 +117,9 @@ i915-y += dvo_ch7017.o \
 # Post-mortem debug and GPU hang state capture
 i915-$(CONFIG_DRM_I915_CAPTURE_ERROR) += i915_gpu_error.o
 
+# intel precise touch & stylus
+i915-y  += intel_ipts.o
+
 # virtual gpu code
 i915-y += i915_vgpu.o
 
