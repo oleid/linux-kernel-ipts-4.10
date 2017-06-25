@@ -284,7 +284,7 @@ static int intelfb_create(struct drm_fb_helper *helper,
 out_destroy_fbi:
 	drm_fb_helper_release_fbi(helper);
 out_unpin:
-	intel_unpin_fb_obj(&ifbdev->fb->base, DRM_ROTATE_0);
+	intel_unpin_fb_vma(vma);
 out_unlock:
 	mutex_unlock(&dev->struct_mutex);
 	return ret;
@@ -357,14 +357,13 @@ static bool intel_fb_initial_config(struct drm_fb_helper *fb_helper,
 				    bool *enabled, int width, int height)
 {
 	struct drm_i915_private *dev_priv = to_i915(fb_helper->dev);
-	unsigned long conn_configured, mask;
+	unsigned long conn_configured, conn_seq, mask;
 	unsigned int count = min(fb_helper->connector_count, BITS_PER_LONG);
 	int i, j;
 	bool *save_enabled;
 	bool fallback = true;
 	int num_connectors_enabled = 0;
 	int num_connectors_detected = 0;
-	int pass = 0;
 
 	save_enabled = kcalloc(count, sizeof(bool), GFP_KERNEL);
 	if (!save_enabled)
@@ -374,6 +373,7 @@ static bool intel_fb_initial_config(struct drm_fb_helper *fb_helper,
 	mask = BIT(count) - 1;
 	conn_configured = 0;
 retry:
+	conn_seq = conn_configured;
 	for (i = 0; i < count; i++) {
 		struct drm_fb_helper_connector *fb_conn;
 		struct drm_connector *connector;
@@ -387,7 +387,7 @@ retry:
 		if (conn_configured & BIT(i))
 			continue;
 
-		if (pass == 0 && !connector->has_tile)
+		if (conn_seq == 0 && !connector->has_tile)
 			continue;
 
 		if (connector->status == connector_status_connected)
@@ -498,10 +498,8 @@ retry:
 		conn_configured |= BIT(i);
 	}
 
-	if ((conn_configured & mask) != mask) {
-		pass++;
+	if ((conn_configured & mask) != mask && conn_configured != conn_seq)
 		goto retry;
-	}
 
 	/*
 	 * If the BIOS didn't enable everything it could, fall back to have the
@@ -549,7 +547,7 @@ static void intel_fbdev_destroy(struct intel_fbdev *ifbdev)
 
 	if (ifbdev->fb) {
 		mutex_lock(&ifbdev->helper.dev->struct_mutex);
-		intel_unpin_fb_obj(&ifbdev->fb->base, DRM_ROTATE_0);
+		intel_unpin_fb_vma(ifbdev->vma);
 		mutex_unlock(&ifbdev->helper.dev->struct_mutex);
 
 		drm_framebuffer_remove(&ifbdev->fb->base);
@@ -741,6 +739,9 @@ static void intel_fbdev_initial_config(void *data, async_cookie_t cookie)
 void intel_fbdev_initial_config_async(struct drm_device *dev)
 {
 	struct intel_fbdev *ifbdev = to_i915(dev)->fbdev;
+
+	if (!ifbdev)
+		return;
 
 	ifbdev->cookie = async_schedule(intel_fbdev_initial_config, ifbdev);
 }

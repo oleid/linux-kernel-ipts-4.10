@@ -230,8 +230,8 @@ static struct intel_vgpu_type *intel_gvt_find_vgpu_type(struct intel_gvt *gvt,
 	return NULL;
 }
 
-static ssize_t available_instance_show(struct kobject *kobj, struct device *dev,
-		char *buf)
+static ssize_t available_instances_show(struct kobject *kobj,
+					struct device *dev, char *buf)
 {
 	struct intel_vgpu_type *type;
 	unsigned int num = 0;
@@ -269,12 +269,12 @@ static ssize_t description_show(struct kobject *kobj, struct device *dev,
 				type->fence);
 }
 
-static MDEV_TYPE_ATTR_RO(available_instance);
+static MDEV_TYPE_ATTR_RO(available_instances);
 static MDEV_TYPE_ATTR_RO(device_api);
 static MDEV_TYPE_ATTR_RO(description);
 
 static struct attribute *type_attrs[] = {
-	&mdev_type_attr_available_instance.attr,
+	&mdev_type_attr_available_instances.attr,
 	&mdev_type_attr_device_api.attr,
 	&mdev_type_attr_description.attr,
 	NULL,
@@ -398,6 +398,7 @@ static int intel_vgpu_create(struct kobject *kobj, struct mdev_device *mdev)
 	struct intel_vgpu_type *type;
 	struct device *pdev;
 	void *gvt;
+	int ret;
 
 	pdev = mdev_parent_dev(mdev);
 	gvt = kdev_to_i915(pdev)->gvt;
@@ -406,13 +407,15 @@ static int intel_vgpu_create(struct kobject *kobj, struct mdev_device *mdev)
 	if (!type) {
 		gvt_err("failed to find type %s to create\n",
 						kobject_name(kobj));
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
 
 	vgpu = intel_gvt_ops->vgpu_create(gvt, type);
 	if (IS_ERR_OR_NULL(vgpu)) {
-		gvt_err("create intel vgpu failed\n");
-		return -EINVAL;
+		ret = vgpu == NULL ? -EFAULT : PTR_ERR(vgpu);
+		gvt_err("failed to create intel vgpu: %d\n", ret);
+		goto out;
 	}
 
 	INIT_WORK(&vgpu->vdev.release_work, intel_vgpu_release_work);
@@ -422,7 +425,10 @@ static int intel_vgpu_create(struct kobject *kobj, struct mdev_device *mdev)
 
 	gvt_dbg_core("intel_vgpu_create succeeded for mdev: %s\n",
 		     dev_name(mdev_dev(mdev)));
-	return 0;
+	ret = 0;
+
+out:
+	return ret;
 }
 
 static int intel_vgpu_remove(struct mdev_device *mdev)
@@ -1328,6 +1334,7 @@ static int kvmgt_guest_init(struct mdev_device *mdev)
 	vgpu->handle = (unsigned long)info;
 	info->vgpu = vgpu;
 	info->kvm = kvm;
+	kvm_get_kvm(info->kvm);
 
 	kvmgt_protect_table_init(info);
 	gvt_cache_init(vgpu);
@@ -1347,6 +1354,7 @@ static bool kvmgt_guest_exit(struct kvmgt_guest_info *info)
 	}
 
 	kvm_page_track_unregister_notifier(info->kvm, &info->track_node);
+	kvm_put_kvm(info->kvm);
 	kvmgt_protect_table_destroy(info);
 	gvt_cache_destroy(info->vgpu);
 	vfree(info);
@@ -1414,7 +1422,7 @@ static int kvmgt_rw_gpa(unsigned long handle, unsigned long gpa,
 {
 	struct kvmgt_guest_info *info;
 	struct kvm *kvm;
-	int ret;
+	int idx, ret;
 	bool kthread = current->mm == NULL;
 
 	if (!handle_valid(handle))
@@ -1426,8 +1434,10 @@ static int kvmgt_rw_gpa(unsigned long handle, unsigned long gpa,
 	if (kthread)
 		use_mm(kvm->mm);
 
+	idx = srcu_read_lock(&kvm->srcu);
 	ret = write ? kvm_write_guest(kvm, gpa, buf, len) :
 		      kvm_read_guest(kvm, gpa, buf, len);
+	srcu_read_unlock(&kvm->srcu, idx);
 
 	if (kthread)
 		unuse_mm(kvm->mm);

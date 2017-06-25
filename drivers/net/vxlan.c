@@ -1798,7 +1798,7 @@ static int vxlan_build_skb(struct sk_buff *skb, struct dst_entry *dst,
 static struct rtable *vxlan_get_route(struct vxlan_dev *vxlan, struct net_device *dev,
 				      struct vxlan_sock *sock4,
 				      struct sk_buff *skb, int oif, u8 tos,
-				      __be32 daddr, __be32 *saddr,
+				      __be32 daddr, __be32 *saddr, __be16 dport, __be16 sport,
 				      struct dst_cache *dst_cache,
 				      const struct ip_tunnel_info *info)
 {
@@ -1824,6 +1824,8 @@ static struct rtable *vxlan_get_route(struct vxlan_dev *vxlan, struct net_device
 	fl4.flowi4_proto = IPPROTO_UDP;
 	fl4.daddr = daddr;
 	fl4.saddr = *saddr;
+	fl4.fl4_dport = dport;
+	fl4.fl4_sport = sport;
 
 	rt = ip_route_output_key(vxlan->net, &fl4);
 	if (likely(!IS_ERR(rt))) {
@@ -1851,6 +1853,7 @@ static struct dst_entry *vxlan6_get_route(struct vxlan_dev *vxlan,
 					  __be32 label,
 					  const struct in6_addr *daddr,
 					  struct in6_addr *saddr,
+					  __be16 dport, __be16 sport,
 					  struct dst_cache *dst_cache,
 					  const struct ip_tunnel_info *info)
 {
@@ -1877,6 +1880,8 @@ static struct dst_entry *vxlan6_get_route(struct vxlan_dev *vxlan,
 	fl6.flowlabel = ip6_make_flowinfo(RT_TOS(tos), label);
 	fl6.flowi6_mark = skb->mark;
 	fl6.flowi6_proto = IPPROTO_UDP;
+	fl6.fl6_dport = dport;
+	fl6.fl6_sport = sport;
 
 	err = ipv6_stub->ipv6_dst_lookup(vxlan->net,
 					 sock6->sock->sk,
@@ -1987,7 +1992,6 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 	const struct iphdr *old_iph = ip_hdr(skb);
 	union vxlan_addr *dst;
 	union vxlan_addr remote_ip, local_ip;
-	union vxlan_addr *src;
 	struct vxlan_metadata _md;
 	struct vxlan_metadata *md = &_md;
 	__be16 src_port = 0, dst_port;
@@ -2014,7 +2018,7 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 
 		dst_port = rdst->remote_port ? rdst->remote_port : vxlan->cfg.dst_port;
 		vni = rdst->remote_vni;
-		src = &vxlan->cfg.saddr;
+		local_ip = vxlan->cfg.saddr;
 		dst_cache = &rdst->dst_cache;
 		md->gbp = skb->mark;
 		ttl = vxlan->cfg.ttl;
@@ -2047,7 +2051,6 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 		dst = &remote_ip;
 		dst_port = info->key.tp_dst ? : vxlan->cfg.dst_port;
 		vni = tunnel_id_to_key32(info->key.tun_id);
-		src = &local_ip;
 		dst_cache = &info->dst_cache;
 		if (info->options_len)
 			md = ip_tunnel_info_opts(info);
@@ -2059,6 +2062,7 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 	src_port = udp_flow_src_port(dev_net(dev), skb, vxlan->cfg.port_min,
 				     vxlan->cfg.port_max, true);
 
+	rcu_read_lock();
 	if (dst->sa.sa_family == AF_INET) {
 		struct vxlan_sock *sock4 = rcu_dereference(vxlan->vn4_sock);
 		struct rtable *rt;
@@ -2067,7 +2071,8 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 		rt = vxlan_get_route(vxlan, dev, sock4, skb,
 				     rdst ? rdst->remote_ifindex : 0, tos,
 				     dst->sin.sin_addr.s_addr,
-				     &src->sin.sin_addr.s_addr,
+				     &local_ip.sin.sin_addr.s_addr,
+				     dst_port, src_port,
 				     dst_cache, info);
 		if (IS_ERR(rt)) {
 			err = PTR_ERR(rt);
@@ -2080,7 +2085,7 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 						    dst_port, vni, &rt->dst,
 						    rt->rt_flags);
 			if (err)
-				return;
+				goto out_unlock;
 		} else if (info->key.tun_flags & TUNNEL_DONT_FRAGMENT) {
 			df = htons(IP_DF);
 		}
@@ -2093,7 +2098,7 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 		if (err < 0)
 			goto tx_error;
 
-		udp_tunnel_xmit_skb(rt, sock4->sock->sk, skb, src->sin.sin_addr.s_addr,
+		udp_tunnel_xmit_skb(rt, sock4->sock->sk, skb, local_ip.sin.sin_addr.s_addr,
 				    dst->sin.sin_addr.s_addr, tos, ttl, df,
 				    src_port, dst_port, xnet, !udp_sum);
 #if IS_ENABLED(CONFIG_IPV6)
@@ -2103,7 +2108,8 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 		ndst = vxlan6_get_route(vxlan, dev, sock6, skb,
 					rdst ? rdst->remote_ifindex : 0, tos,
 					label, &dst->sin6.sin6_addr,
-					&src->sin6.sin6_addr,
+					&local_ip.sin6.sin6_addr,
+					dst_port, src_port,
 					dst_cache, info);
 		if (IS_ERR(ndst)) {
 			err = PTR_ERR(ndst);
@@ -2118,7 +2124,7 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 						    dst_port, vni, ndst,
 						    rt6i_flags);
 			if (err)
-				return;
+				goto out_unlock;
 		}
 
 		tos = ip_tunnel_ecn_encap(tos, old_iph, skb);
@@ -2130,11 +2136,13 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
 			goto tx_error;
 
 		udp_tunnel6_xmit_skb(ndst, sock6->sock->sk, skb, dev,
-				     &src->sin6.sin6_addr,
+				     &local_ip.sin6.sin6_addr,
 				     &dst->sin6.sin6_addr, tos, ttl,
 				     label, src_port, dst_port, !udp_sum);
 #endif
 	}
+out_unlock:
+	rcu_read_unlock();
 	return;
 
 drop:
@@ -2143,6 +2151,7 @@ drop:
 	return;
 
 tx_error:
+	rcu_read_unlock();
 	if (err == -ELOOP)
 		dev->stats.collisions++;
 	else if (err == -ENETUNREACH)
@@ -2261,7 +2270,7 @@ static void vxlan_cleanup(unsigned long arg)
 				= container_of(p, struct vxlan_fdb, hlist);
 			unsigned long timeout;
 
-			if (f->state & NUD_PERMANENT)
+			if (f->state & (NUD_PERMANENT | NUD_NOARP))
 				continue;
 
 			timeout = f->used + vxlan->cfg.age_interval * HZ;
@@ -2347,7 +2356,7 @@ static int vxlan_open(struct net_device *dev)
 }
 
 /* Purge the forwarding table */
-static void vxlan_flush(struct vxlan_dev *vxlan)
+static void vxlan_flush(struct vxlan_dev *vxlan, bool do_all)
 {
 	unsigned int h;
 
@@ -2357,6 +2366,8 @@ static void vxlan_flush(struct vxlan_dev *vxlan)
 		hlist_for_each_safe(p, n, &vxlan->fdb_head[h]) {
 			struct vxlan_fdb *f
 				= container_of(p, struct vxlan_fdb, hlist);
+			if (!do_all && (f->state & (NUD_PERMANENT | NUD_NOARP)))
+				continue;
 			/* the all_zeros_mac entry is deleted at vxlan_uninit */
 			if (!is_zero_ether_addr(f->eth_addr))
 				vxlan_fdb_destroy(vxlan, f);
@@ -2378,7 +2389,7 @@ static int vxlan_stop(struct net_device *dev)
 
 	del_timer_sync(&vxlan->age_timer);
 
-	vxlan_flush(vxlan);
+	vxlan_flush(vxlan, false);
 	vxlan_sock_release(vxlan);
 
 	return ret;
@@ -2430,7 +2441,8 @@ static int vxlan_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb)
 
 		rt = vxlan_get_route(vxlan, dev, sock4, skb, 0, info->key.tos,
 				     info->key.u.ipv4.dst,
-				     &info->key.u.ipv4.src, NULL, info);
+				     &info->key.u.ipv4.src, dport, sport,
+				     &info->dst_cache, info);
 		if (IS_ERR(rt))
 			return PTR_ERR(rt);
 		ip_rt_put(rt);
@@ -2441,7 +2453,8 @@ static int vxlan_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb)
 
 		ndst = vxlan6_get_route(vxlan, dev, sock6, skb, 0, info->key.tos,
 					info->key.label, &info->key.u.ipv6.dst,
-					&info->key.u.ipv6.src, NULL, info);
+					&info->key.u.ipv6.src, dport, sport,
+					&info->dst_cache, info);
 		if (IS_ERR(ndst))
 			return PTR_ERR(ndst);
 		dst_release(ndst);
@@ -2615,7 +2628,7 @@ static int vxlan_validate(struct nlattr *tb[], struct nlattr *data[])
 
 	if (data[IFLA_VXLAN_ID]) {
 		__u32 id = nla_get_u32(data[IFLA_VXLAN_ID]);
-		if (id >= VXLAN_VID_MASK)
+		if (id >= VXLAN_N_VID)
 			return -ERANGE;
 	}
 
@@ -2883,7 +2896,7 @@ static int vxlan_dev_configure(struct net *src_net, struct net_device *dev,
 	memcpy(&vxlan->cfg, conf, sizeof(*conf));
 	if (!vxlan->cfg.dst_port) {
 		if (conf->flags & VXLAN_F_GPE)
-			vxlan->cfg.dst_port = 4790; /* IANA assigned VXLAN-GPE port */
+			vxlan->cfg.dst_port = htons(4790); /* IANA VXLAN-GPE port */
 		else
 			vxlan->cfg.dst_port = default_port;
 	}
@@ -3050,6 +3063,8 @@ static void vxlan_dellink(struct net_device *dev, struct list_head *head)
 {
 	struct vxlan_dev *vxlan = netdev_priv(dev);
 	struct vxlan_net *vn = net_generic(vxlan->net, vxlan_net_id);
+
+	vxlan_flush(vxlan, true);
 
 	spin_lock(&vn->sock_lock);
 	if (!hlist_unhashed(&vxlan->hlist))

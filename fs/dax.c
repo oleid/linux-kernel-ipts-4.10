@@ -369,6 +369,22 @@ restart:
 		}
 		spin_lock_irq(&mapping->tree_lock);
 
+		if (!entry) {
+			/*
+			 * We needed to drop the page_tree lock while calling
+			 * radix_tree_preload() and we didn't have an entry to
+			 * lock.  See if another thread inserted an entry at
+			 * our index during this time.
+			 */
+			entry = __radix_tree_lookup(&mapping->page_tree, index,
+					NULL, &slot);
+			if (entry) {
+				radix_tree_preload_end();
+				spin_unlock_irq(&mapping->tree_lock);
+				goto restart;
+			}
+		}
+
 		if (pmd_downgrade) {
 			radix_tree_delete(&mapping->page_tree, index);
 			mapping->nrexceptional--;
@@ -384,19 +400,12 @@ restart:
 		if (err) {
 			spin_unlock_irq(&mapping->tree_lock);
 			/*
-			 * Someone already created the entry?  This is a
-			 * normal failure when inserting PMDs in a range
-			 * that already contains PTEs.  In that case we want
-			 * to return -EEXIST immediately.
-			 */
-			if (err == -EEXIST && !(size_flag & RADIX_DAX_PMD))
-				goto restart;
-			/*
-			 * Our insertion of a DAX PMD entry failed, most
-			 * likely because it collided with a PTE sized entry
-			 * at a different index in the PMD range.  We haven't
-			 * inserted anything into the radix tree and have no
-			 * waiters to wake.
+			 * Our insertion of a DAX entry failed, most likely
+			 * because we were inserting a PMD entry and it
+			 * collided with a PTE sized entry at a different
+			 * index in the PMD range.  We haven't inserted
+			 * anything into the radix tree and have no waiters to
+			 * wake.
 			 */
 			return ERR_PTR(err);
 		}
@@ -490,35 +499,6 @@ int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index)
 	 * at that index as well...
 	 */
 	WARN_ON_ONCE(!ret);
-	return ret;
-}
-
-/*
- * Invalidate exceptional DAX entry if easily possible. This handles DAX
- * entries for invalidate_inode_pages() so we evict the entry only if we can
- * do so without blocking.
- */
-int dax_invalidate_mapping_entry(struct address_space *mapping, pgoff_t index)
-{
-	int ret = 0;
-	void *entry, **slot;
-	struct radix_tree_root *page_tree = &mapping->page_tree;
-
-	spin_lock_irq(&mapping->tree_lock);
-	entry = __radix_tree_lookup(page_tree, index, NULL, &slot);
-	if (!entry || !radix_tree_exceptional_entry(entry) ||
-	    slot_locked(mapping, slot))
-		goto out;
-	if (radix_tree_tag_get(page_tree, index, PAGECACHE_TAG_DIRTY) ||
-	    radix_tree_tag_get(page_tree, index, PAGECACHE_TAG_TOWRITE))
-		goto out;
-	radix_tree_delete(page_tree, index);
-	mapping->nrexceptional--;
-	ret = 1;
-out:
-	spin_unlock_irq(&mapping->tree_lock);
-	if (ret)
-		dax_wake_mapping_entry_waiter(mapping, index, entry, true);
 	return ret;
 }
 
@@ -691,8 +671,8 @@ static void dax_mapping_entry_mkclean(struct address_space *mapping,
 				      pgoff_t index, unsigned long pfn)
 {
 	struct vm_area_struct *vma;
-	pte_t *ptep;
-	pte_t pte;
+	pte_t pte, *ptep = NULL;
+	pmd_t *pmdp = NULL;
 	spinlock_t *ptl;
 	bool changed;
 
@@ -707,21 +687,42 @@ static void dax_mapping_entry_mkclean(struct address_space *mapping,
 
 		address = pgoff_address(index, vma);
 		changed = false;
-		if (follow_pte(vma->vm_mm, address, &ptep, &ptl))
+		if (follow_pte_pmd(vma->vm_mm, address, &ptep, &pmdp, &ptl))
 			continue;
-		if (pfn != pte_pfn(*ptep))
-			goto unlock;
-		if (!pte_dirty(*ptep) && !pte_write(*ptep))
-			goto unlock;
 
-		flush_cache_page(vma, address, pfn);
-		pte = ptep_clear_flush(vma, address, ptep);
-		pte = pte_wrprotect(pte);
-		pte = pte_mkclean(pte);
-		set_pte_at(vma->vm_mm, address, ptep, pte);
-		changed = true;
-unlock:
-		pte_unmap_unlock(ptep, ptl);
+		if (pmdp) {
+#ifdef CONFIG_FS_DAX_PMD
+			pmd_t pmd;
+
+			if (pfn != pmd_pfn(*pmdp))
+				goto unlock_pmd;
+			if (!pmd_dirty(*pmdp) && !pmd_write(*pmdp))
+				goto unlock_pmd;
+
+			flush_cache_page(vma, address, pfn);
+			pmd = pmdp_huge_clear_flush(vma, address, pmdp);
+			pmd = pmd_wrprotect(pmd);
+			pmd = pmd_mkclean(pmd);
+			set_pmd_at(vma->vm_mm, address, pmdp, pmd);
+			changed = true;
+unlock_pmd:
+			spin_unlock(ptl);
+#endif
+		} else {
+			if (pfn != pte_pfn(*ptep))
+				goto unlock_pte;
+			if (!pte_dirty(*ptep) && !pte_write(*ptep))
+				goto unlock_pte;
+
+			flush_cache_page(vma, address, pfn);
+			pte = ptep_clear_flush(vma, address, ptep);
+			pte = pte_wrprotect(pte);
+			pte = pte_mkclean(pte);
+			set_pte_at(vma->vm_mm, address, ptep, pte);
+			changed = true;
+unlock_pte:
+			pte_unmap_unlock(ptep, ptl);
+		}
 
 		if (changed)
 			mmu_notifier_invalidate_page(vma->vm_mm, address);
@@ -969,7 +970,6 @@ int __dax_zero_page_range(struct block_device *bdev, sector_t sector,
 }
 EXPORT_SYMBOL_GPL(__dax_zero_page_range);
 
-#ifdef CONFIG_FS_IOMAP
 static sector_t dax_iomap_sector(struct iomap *iomap, loff_t pos)
 {
 	return iomap->blkno + (((pos & PAGE_MASK) - iomap->offset) >> 9);
@@ -1000,7 +1000,7 @@ dax_iomap_actor(struct inode *inode, loff_t pos, loff_t length, void *data,
 	 * into page tables. We have to tear down these mappings so that data
 	 * written by write(2) is visible in mmap.
 	 */
-	if ((iomap->flags & IOMAP_F_NEW) && inode->i_mapping->nrpages) {
+	if (iomap->flags & IOMAP_F_NEW) {
 		invalidate_inode_pages2_range(inode->i_mapping,
 					      pos >> PAGE_SHIFT,
 					      (end - 1) >> PAGE_SHIFT);
@@ -1010,6 +1010,11 @@ dax_iomap_actor(struct inode *inode, loff_t pos, loff_t length, void *data,
 		unsigned offset = pos & (PAGE_SIZE - 1);
 		struct blk_dax_ctl dax = { 0 };
 		ssize_t map_len;
+
+		if (fatal_signal_pending(current)) {
+			ret = -EINTR;
+			break;
+		}
 
 		dax.sector = dax_iomap_sector(iomap, pos);
 		dax.size = (length + offset + PAGE_SIZE - 1) & PAGE_MASK;
@@ -1407,4 +1412,3 @@ int dax_iomap_pmd_fault(struct vm_area_struct *vma, unsigned long address,
 }
 EXPORT_SYMBOL_GPL(dax_iomap_pmd_fault);
 #endif /* CONFIG_FS_DAX_PMD */
-#endif /* CONFIG_FS_IOMAP */

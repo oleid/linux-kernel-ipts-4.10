@@ -440,7 +440,7 @@ i915_gem_object_wait_reservation(struct reservation_object *resv,
 			timeout = i915_gem_object_wait_fence(shared[i],
 							     flags, timeout,
 							     rps);
-			if (timeout <= 0)
+			if (timeout < 0)
 				break;
 
 			dma_fence_put(shared[i]);
@@ -453,7 +453,7 @@ i915_gem_object_wait_reservation(struct reservation_object *resv,
 		excl = reservation_object_get_excl_rcu(resv);
 	}
 
-	if (excl && timeout > 0)
+	if (excl && timeout >= 0)
 		timeout = i915_gem_object_wait_fence(excl, flags, timeout, rps);
 
 	dma_fence_put(excl);
@@ -595,47 +595,21 @@ i915_gem_phys_pwrite(struct drm_i915_gem_object *obj,
 		     struct drm_i915_gem_pwrite *args,
 		     struct drm_file *file)
 {
-	struct drm_device *dev = obj->base.dev;
 	void *vaddr = obj->phys_handle->vaddr + args->offset;
 	char __user *user_data = u64_to_user_ptr(args->data_ptr);
-	int ret;
 
 	/* We manually control the domain here and pretend that it
 	 * remains coherent i.e. in the GTT domain, like shmem_pwrite.
 	 */
-	lockdep_assert_held(&obj->base.dev->struct_mutex);
-	ret = i915_gem_object_wait(obj,
-				   I915_WAIT_INTERRUPTIBLE |
-				   I915_WAIT_LOCKED |
-				   I915_WAIT_ALL,
-				   MAX_SCHEDULE_TIMEOUT,
-				   to_rps_client(file));
-	if (ret)
-		return ret;
-
 	intel_fb_obj_invalidate(obj, ORIGIN_CPU);
-	if (__copy_from_user_inatomic_nocache(vaddr, user_data, args->size)) {
-		unsigned long unwritten;
-
-		/* The physical object once assigned is fixed for the lifetime
-		 * of the obj, so we can safely drop the lock and continue
-		 * to access vaddr.
-		 */
-		mutex_unlock(&dev->struct_mutex);
-		unwritten = copy_from_user(vaddr, user_data, args->size);
-		mutex_lock(&dev->struct_mutex);
-		if (unwritten) {
-			ret = -EFAULT;
-			goto out;
-		}
-	}
+	if (copy_from_user(vaddr, user_data, args->size))
+		return -EFAULT;
 
 	drm_clflush_virt_range(vaddr, args->size);
-	i915_gem_chipset_flush(to_i915(dev));
+	i915_gem_chipset_flush(to_i915(obj->base.dev));
 
-out:
 	intel_fb_obj_flush(obj, false, ORIGIN_CPU);
-	return ret;
+	return 0;
 }
 
 void *i915_gem_object_alloc(struct drm_device *dev)
@@ -2036,8 +2010,16 @@ void i915_gem_runtime_suspend(struct drm_i915_private *dev_priv)
 	for (i = 0; i < dev_priv->num_fence_regs; i++) {
 		struct drm_i915_fence_reg *reg = &dev_priv->fence_regs[i];
 
-		if (WARN_ON(reg->pin_count))
-			continue;
+		/* Ideally we want to assert that the fence register is not
+		 * live at this point (i.e. that no piece of code will be
+		 * trying to write through fence + GTT, as that both violates
+		 * our tracking of activity and associated locking/barriers,
+		 * but also is illegal given that the hw is powered down).
+		 *
+		 * Previously we used reg->pin_count as a "liveness" indicator.
+		 * That is not sufficient, and we need a more fine-grained
+		 * tool if we want to have a sanity check here.
+		 */
 
 		if (!reg->vma)
 			continue;
@@ -2202,6 +2184,7 @@ i915_gem_object_truncate(struct drm_i915_gem_object *obj)
 	 */
 	shmem_truncate_range(file_inode(obj->base.filp), 0, (loff_t)-1);
 	obj->mm.madv = __I915_MADV_PURGED;
+	obj->mm.pages = ERR_PTR(-EFAULT);
 }
 
 /* Try to discard unwanted pages */
@@ -2301,7 +2284,9 @@ void __i915_gem_object_put_pages(struct drm_i915_gem_object *obj,
 
 	__i915_gem_object_reset_page_iter(obj);
 
-	obj->ops->put_pages(obj, pages);
+	if (!IS_ERR(pages))
+		obj->ops->put_pages(obj, pages);
+
 unlock:
 	mutex_unlock(&obj->mm.lock);
 }
@@ -2519,7 +2504,7 @@ int __i915_gem_object_get_pages(struct drm_i915_gem_object *obj)
 	if (err)
 		return err;
 
-	if (unlikely(!obj->mm.pages)) {
+	if (unlikely(IS_ERR_OR_NULL(obj->mm.pages))) {
 		err = ____i915_gem_object_get_pages(obj);
 		if (err)
 			goto unlock;
@@ -2597,7 +2582,7 @@ void *i915_gem_object_pin_map(struct drm_i915_gem_object *obj,
 
 	pinned = true;
 	if (!atomic_inc_not_zero(&obj->mm.pages_pin_count)) {
-		if (unlikely(!obj->mm.pages)) {
+		if (unlikely(IS_ERR_OR_NULL(obj->mm.pages))) {
 			ret = ____i915_gem_object_get_pages(obj);
 			if (ret)
 				goto err_unlock;
@@ -3020,6 +3005,16 @@ i915_gem_wait_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
 	if (args->timeout_ns > 0) {
 		args->timeout_ns -= ktime_to_ns(ktime_sub(ktime_get(), start));
 		if (args->timeout_ns < 0)
+			args->timeout_ns = 0;
+
+		/*
+		 * Apparently ktime isn't accurate enough and occasionally has a
+		 * bit of mismatch in the jiffies<->nsecs<->ktime loop. So patch
+		 * things up to make the test happy. We allow up to 1 jiffy.
+		 *
+		 * This is a regression from the timespec->ktime conversion.
+		 */
+		if (ret == -ETIME && !nsecs_to_jiffies(args->timeout_ns))
 			args->timeout_ns = 0;
 	}
 
@@ -3504,7 +3499,7 @@ i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
 	vma->display_alignment = max_t(u64, vma->display_alignment, alignment);
 
 	/* Treat this as an end-of-frame, like intel_user_framebuffer_dirty() */
-	if (obj->cache_dirty) {
+	if (obj->cache_dirty || obj->base.write_domain == I915_GEM_DOMAIN_CPU) {
 		i915_gem_clflush_object(obj, true);
 		intel_fb_obj_flush(obj, false, ORIGIN_DIRTYFB);
 	}
@@ -4571,8 +4566,6 @@ i915_gem_load_init(struct drm_device *dev)
 			  i915_gem_idle_work_handler);
 	init_waitqueue_head(&dev_priv->gpu_error.wait_queue);
 	init_waitqueue_head(&dev_priv->gpu_error.reset_queue);
-
-	dev_priv->relative_constants_mode = I915_EXEC_CONSTANTS_REL_GENERAL;
 
 	init_waitqueue_head(&dev_priv->pending_flip_queue);
 

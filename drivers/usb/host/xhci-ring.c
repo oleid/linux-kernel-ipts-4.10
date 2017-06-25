@@ -913,17 +913,6 @@ void xhci_stop_endpoint_command_watchdog(unsigned long arg)
 	spin_lock_irqsave(&xhci->lock, flags);
 
 	ep->stop_cmds_pending--;
-	if (xhci->xhc_state & XHCI_STATE_REMOVING) {
-		spin_unlock_irqrestore(&xhci->lock, flags);
-		return;
-	}
-	if (xhci->xhc_state & XHCI_STATE_DYING) {
-		xhci_dbg_trace(xhci, trace_xhci_dbg_cancel_urb,
-				"Stop EP timer ran, but another timer marked "
-				"xHCI as DYING, exiting.");
-		spin_unlock_irqrestore(&xhci->lock, flags);
-		return;
-	}
 	if (!(ep->stop_cmds_pending == 0 && (ep->ep_state & EP_HALT_PENDING))) {
 		xhci_dbg_trace(xhci, trace_xhci_dbg_cancel_urb,
 				"Stop EP timer ran, but no command pending, "
@@ -2010,6 +1999,9 @@ static int process_ctrl_td(struct xhci_hcd *xhci, struct xhci_td *td,
 		case TRB_DATA:
 		case TRB_NORMAL:
 			td->urb->actual_length = requested - remaining;
+			goto finish_td;
+		case TRB_STATUS:
+			td->urb->actual_length = requested;
 			goto finish_td;
 		default:
 			xhci_warn(xhci, "WARN: unexpected TRB Type %d\n",

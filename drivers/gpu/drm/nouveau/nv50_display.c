@@ -995,7 +995,6 @@ nv50_wndw_atomic_destroy_state(struct drm_plane *plane,
 {
 	struct nv50_wndw_atom *asyw = nv50_wndw_atom(state);
 	__drm_atomic_helper_plane_destroy_state(&asyw->state);
-	dma_fence_put(asyw->state.fence);
 	kfree(asyw);
 }
 
@@ -1007,7 +1006,6 @@ nv50_wndw_atomic_duplicate_state(struct drm_plane *plane)
 	if (!(asyw = kmalloc(sizeof(*asyw), GFP_KERNEL)))
 		return NULL;
 	__drm_atomic_helper_plane_duplicate_state(plane, &asyw->state);
-	asyw->state.fence = NULL;
 	asyw->interval = 1;
 	asyw->sema = armw->sema;
 	asyw->ntfy = armw->ntfy;
@@ -2038,6 +2036,7 @@ nv50_head_atomic_check_mode(struct nv50_head *head, struct nv50_head_atom *asyh)
 	u32 vbackp  = (mode->vtotal - mode->vsync_end) * vscan / ilace;
 	u32 hfrontp =  mode->hsync_start - mode->hdisplay;
 	u32 vfrontp = (mode->vsync_start - mode->vdisplay) * vscan / ilace;
+	u32 blankus;
 	struct nv50_head_mode *m = &asyh->mode;
 
 	m->h.active = mode->htotal;
@@ -2051,9 +2050,10 @@ nv50_head_atomic_check_mode(struct nv50_head *head, struct nv50_head_atom *asyh)
 	m->v.blanks = m->v.active - vfrontp - 1;
 
 	/*XXX: Safe underestimate, even "0" works */
-	m->v.blankus = (m->v.active - mode->vdisplay - 2) * m->h.active;
-	m->v.blankus *= 1000;
-	m->v.blankus /= mode->clock;
+	blankus = (m->v.active - mode->vdisplay - 2) * m->h.active;
+	blankus *= 1000;
+	blankus /= mode->clock;
+	m->v.blankus = blankus;
 
 	if (mode->flags & DRM_MODE_FLAG_INTERLACE) {
 		m->v.blank2e =  m->v.active + m->v.synce + vbackp;
@@ -4052,6 +4052,11 @@ nv50_disp_atomic_commit_tail(struct drm_atomic_state *state)
 		}
 	}
 
+	for_each_crtc_in_state(state, crtc, crtc_state, i) {
+		if (crtc->state->event)
+			drm_crtc_vblank_get(crtc);
+	}
+
 	/* Update plane(s). */
 	for_each_plane_in_state(state, plane, plane_state, i) {
 		struct nv50_wndw_atom *asyw = nv50_wndw_atom(plane->state);
@@ -4101,6 +4106,7 @@ nv50_disp_atomic_commit_tail(struct drm_atomic_state *state)
 			drm_crtc_send_vblank_event(crtc, crtc->state->event);
 			spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
 			crtc->state->event = NULL;
+			drm_crtc_vblank_put(crtc);
 		}
 	}
 

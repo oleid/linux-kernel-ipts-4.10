@@ -1191,7 +1191,7 @@ qla24xx_reset_risc(scsi_qla_host_t *vha)
 
 	/* Wait for soft-reset to complete. */
 	RD_REG_DWORD(&reg->ctrl_status);
-	for (cnt = 0; cnt < 6000000; cnt++) {
+	for (cnt = 0; cnt < 60; cnt++) {
 		barrier();
 		if ((RD_REG_DWORD(&reg->ctrl_status) &
 		    CSRX_ISP_SOFT_RESET) == 0)
@@ -1234,7 +1234,7 @@ qla24xx_reset_risc(scsi_qla_host_t *vha)
 	RD_REG_DWORD(&reg->hccr);
 
 	RD_REG_WORD(&reg->mailbox0);
-	for (cnt = 6000000; RD_REG_WORD(&reg->mailbox0) != 0 &&
+	for (cnt = 60; RD_REG_WORD(&reg->mailbox0) != 0 &&
 	    rval == QLA_SUCCESS; cnt--) {
 		barrier();
 		if (cnt)
@@ -4352,6 +4352,7 @@ qla2x00_update_fcports(scsi_qla_host_t *base_vha)
 			}
 		}
 		atomic_dec(&vha->vref_count);
+		wake_up(&vha->vref_waitq);
 	}
 	spin_unlock_irqrestore(&ha->vport_slock, flags);
 }

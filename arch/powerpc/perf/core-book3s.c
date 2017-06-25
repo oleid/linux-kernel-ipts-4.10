@@ -183,6 +183,8 @@ static inline void perf_get_data_addr(struct pt_regs *regs, u64 *addrp)
 			sdsync = POWER7P_MMCRA_SDAR_VALID;
 		else if (ppmu->flags & PPMU_ALT_SIPR)
 			sdsync = POWER6_MMCRA_SDSYNC;
+		else if (ppmu->flags & PPMU_NO_SIAR)
+			sdsync = MMCRA_SAMPLE_ENABLE;
 		else
 			sdsync = MMCRA_SDSYNC;
 
@@ -294,6 +296,8 @@ static inline void perf_read_regs(struct pt_regs *regs)
 	 * interrupts off hence the userspace check.
 	 */
 	if (TRAP(regs) != 0xf00)
+		use_siar = 0;
+	else if ((ppmu->flags & PPMU_NO_SIAR))
 		use_siar = 0;
 	else if (marked)
 		use_siar = 1;

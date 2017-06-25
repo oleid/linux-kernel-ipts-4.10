@@ -364,58 +364,30 @@ static void free_workload(struct intel_vgpu_workload *workload)
 #define get_desc_from_elsp_dwords(ed, i) \
 	((struct execlist_ctx_descriptor_format *)&((ed)->data[i * 2]))
 
-
-#define BATCH_BUFFER_ADDR_MASK ((1UL << 32) - (1U << 2))
-#define BATCH_BUFFER_ADDR_HIGH_MASK ((1UL << 16) - (1U))
-static int set_gma_to_bb_cmd(struct intel_shadow_bb_entry *entry_obj,
-			     unsigned long add, int gmadr_bytes)
-{
-	if (WARN_ON(gmadr_bytes != 4 && gmadr_bytes != 8))
-		return -1;
-
-	*((u32 *)(entry_obj->bb_start_cmd_va + (1 << 2))) = add &
-		BATCH_BUFFER_ADDR_MASK;
-	if (gmadr_bytes == 8) {
-		*((u32 *)(entry_obj->bb_start_cmd_va + (2 << 2))) =
-			add & BATCH_BUFFER_ADDR_HIGH_MASK;
-	}
-
-	return 0;
-}
-
 static void prepare_shadow_batch_buffer(struct intel_vgpu_workload *workload)
 {
-	int gmadr_bytes = workload->vgpu->gvt->device_info.gmadr_bytes_in_cmd;
+	const int gmadr_bytes = workload->vgpu->gvt->device_info.gmadr_bytes_in_cmd;
+	struct intel_shadow_bb_entry *entry_obj;
 
 	/* pin the gem object to ggtt */
-	if (!list_empty(&workload->shadow_bb)) {
-		struct intel_shadow_bb_entry *entry_obj =
-			list_first_entry(&workload->shadow_bb,
-					 struct intel_shadow_bb_entry,
-					 list);
-		struct intel_shadow_bb_entry *temp;
+	list_for_each_entry(entry_obj, &workload->shadow_bb, list) {
+		struct i915_vma *vma;
 
-		list_for_each_entry_safe(entry_obj, temp, &workload->shadow_bb,
-				list) {
-			struct i915_vma *vma;
-
-			vma = i915_gem_object_ggtt_pin(entry_obj->obj, NULL, 0,
-						       4, 0);
-			if (IS_ERR(vma)) {
-				gvt_err("Cannot pin\n");
-				return;
-			}
-
-			/* FIXME: we are not tracking our pinned VMA leaving it
-			 * up to the core to fix up the stray pin_count upon
-			 * free.
-			 */
-
-			/* update the relocate gma with shadow batch buffer*/
-			set_gma_to_bb_cmd(entry_obj,
-					  i915_ggtt_offset(vma),
-					  gmadr_bytes);
+		vma = i915_gem_object_ggtt_pin(entry_obj->obj, NULL, 0, 4, 0);
+		if (IS_ERR(vma)) {
+			gvt_err("Cannot pin\n");
+			return;
 		}
+
+		/* FIXME: we are not tracking our pinned VMA leaving it
+		 * up to the core to fix up the stray pin_count upon
+		 * free.
+		 */
+
+		/* update the relocate gma with shadow batch buffer*/
+		entry_obj->bb_start_cmd_va[1] = i915_ggtt_offset(vma);
+		if (gmadr_bytes == 8)
+			entry_obj->bb_start_cmd_va[2] = 0;
 	}
 }
 
@@ -806,7 +778,8 @@ static void init_vgpu_execlist(struct intel_vgpu *vgpu, int ring_id)
 			_EL_OFFSET_STATUS_PTR);
 
 	ctx_status_ptr.dw = vgpu_vreg(vgpu, ctx_status_ptr_reg);
-	ctx_status_ptr.read_ptr = ctx_status_ptr.write_ptr = 0x7;
+	ctx_status_ptr.read_ptr = 0;
+	ctx_status_ptr.write_ptr = 0x7;
 	vgpu_vreg(vgpu, ctx_status_ptr_reg) = ctx_status_ptr.dw;
 }
 
@@ -826,7 +799,7 @@ int intel_vgpu_init_execlist(struct intel_vgpu *vgpu)
 		INIT_LIST_HEAD(&vgpu->workload_q_head[i]);
 	}
 
-	vgpu->workloads = kmem_cache_create("gvt-g vgpu workload",
+	vgpu->workloads = kmem_cache_create("gvt-g_vgpu_workload",
 			sizeof(struct intel_vgpu_workload), 0,
 			SLAB_HWCACHE_ALIGN,
 			NULL);

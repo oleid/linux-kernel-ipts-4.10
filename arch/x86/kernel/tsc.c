@@ -694,6 +694,7 @@ unsigned long native_calibrate_tsc(void)
 			crystal_khz = 24000;	/* 24.0 MHz */
 			break;
 		case INTEL_FAM6_SKYLAKE_X:
+		case INTEL_FAM6_ATOM_DENVERTON:
 			crystal_khz = 25000;	/* 25.0 MHz */
 			break;
 		case INTEL_FAM6_ATOM_GOLDMONT:
@@ -1309,6 +1310,8 @@ static int __init init_tsc_clocksource(void)
 	 * the refined calibration and directly register it as a clocksource.
 	 */
 	if (boot_cpu_has(X86_FEATURE_TSC_KNOWN_FREQ)) {
+		if (boot_cpu_has(X86_FEATURE_ART))
+			art_related_clocksource = &clocksource_tsc;
 		clocksource_register_khz(&clocksource_tsc, tsc_khz);
 		return 0;
 	}
@@ -1355,6 +1358,9 @@ void __init tsc_init(void)
 		(unsigned long)cpu_khz / 1000,
 		(unsigned long)cpu_khz % 1000);
 
+	/* Sanitize TSC ADJUST before cyc2ns gets initialized */
+	tsc_store_and_check_tsc_adjust(true);
+
 	/*
 	 * Secondary CPUs do not run through tsc_init(), so set up
 	 * all the scale factors for all CPUs, assuming the same
@@ -1385,8 +1391,6 @@ void __init tsc_init(void)
 
 	if (unsynchronized_tsc())
 		mark_tsc_unstable("TSCs unsynchronized");
-	else
-		tsc_store_and_check_tsc_adjust(true);
 
 	check_system_tsc_reliable();
 

@@ -678,17 +678,8 @@ static void blk_mq_check_expired(struct blk_mq_hw_ctx *hctx,
 {
 	struct blk_mq_timeout_data *data = priv;
 
-	if (!test_bit(REQ_ATOM_STARTED, &rq->atomic_flags)) {
-		/*
-		 * If a request wasn't started before the queue was
-		 * marked dying, kill it here or it'll go unnoticed.
-		 */
-		if (unlikely(blk_queue_dying(rq->q))) {
-			rq->errors = -EIO;
-			blk_mq_end_request(rq, rq->errors);
-		}
+	if (!test_bit(REQ_ATOM_STARTED, &rq->atomic_flags))
 		return;
-	}
 
 	if (time_after_eq(jiffies, rq->deadline)) {
 		if (!blk_mark_rq_complete(rq))
@@ -912,7 +903,6 @@ bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *hctx, struct list_head *list)
 static void blk_mq_process_rq_list(struct blk_mq_hw_ctx *hctx)
 {
 	LIST_HEAD(rq_list);
-	LIST_HEAD(driver_list);
 
 	if (unlikely(blk_mq_hctx_stopped(hctx)))
 		return;

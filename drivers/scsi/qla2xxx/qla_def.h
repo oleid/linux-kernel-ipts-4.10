@@ -1556,7 +1556,8 @@ typedef struct {
 struct atio {
 	uint8_t		entry_type;		/* Entry type. */
 	uint8_t		entry_count;		/* Entry count. */
-	uint8_t		data[58];
+	__le16		attr_n_length;
+	uint8_t		data[56];
 	uint32_t	signature;
 #define ATIO_PROCESSED 0xDEADDEAD		/* Signature */
 };
@@ -2732,7 +2733,7 @@ struct isp_operations {
 #define QLA_MSIX_FW_MODE(m)	(((m) & (BIT_7|BIT_8|BIT_9)) >> 7)
 #define QLA_MSIX_FW_MODE_1(m)	(QLA_MSIX_FW_MODE(m) == 1)
 
-#define QLA_MSIX_DEFAULT		0x00
+#define QLA_BASE_VECTORS	2 /* default + RSP */
 #define QLA_MSIX_RSP_Q			0x01
 #define QLA_ATIO_VECTOR		0x02
 #define QLA_MSIX_QPAIR_MULTIQ_RSP_Q	0x03
@@ -2754,7 +2755,6 @@ struct qla_msix_entry {
 	uint16_t entry;
 	char name[30];
 	void *handle;
-	struct irq_affinity_notify irq_notify;
 	int cpuid;
 };
 
@@ -3788,6 +3788,7 @@ typedef struct scsi_qla_host {
 	struct qla8044_reset_template reset_tmplt;
 	struct qla_tgt_counters tgt_counters;
 	uint16_t	bbcr;
+	wait_queue_head_t vref_waitq;
 } scsi_qla_host_t;
 
 struct qla27xx_image_status {
@@ -3843,14 +3844,17 @@ struct qla2_sgx {
 	mb();						\
 	if (__vha->flags.delete_progress) {		\
 		atomic_dec(&__vha->vref_count);		\
+		wake_up(&__vha->vref_waitq);		\
 		__bail = 1;				\
 	} else {					\
 		__bail = 0;				\
 	}						\
 } while (0)
 
-#define QLA_VHA_MARK_NOT_BUSY(__vha)			\
+#define QLA_VHA_MARK_NOT_BUSY(__vha) do {		\
 	atomic_dec(&__vha->vref_count);			\
+	wake_up(&__vha->vref_waitq);			\
+} while (0)						\
 
 #define QLA_QPAIR_MARK_BUSY(__qpair, __bail) do {	\
 	atomic_inc(&__qpair->ref_count);		\

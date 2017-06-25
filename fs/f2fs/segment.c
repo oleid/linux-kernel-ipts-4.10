@@ -713,8 +713,8 @@ static int __f2fs_issue_discard_zone(struct f2fs_sb_info *sbi,
 	}
 	sector = SECTOR_FROM_BLOCK(blkstart);
 
-	if (sector & (bdev_zone_size(bdev) - 1) ||
-				nr_sects != bdev_zone_size(bdev)) {
+	if (sector & (bdev_zone_sectors(bdev) - 1) ||
+	    nr_sects != bdev_zone_sectors(bdev)) {
 		f2fs_msg(sbi->sb, KERN_INFO,
 			"(%d) %s: Unaligned discard attempted (block %x + %x)",
 			devi, sbi->s_ndevs ? FDEV(devi).path: "",
@@ -935,6 +935,8 @@ next:
 		start = start_segno + sbi->segs_per_sec;
 		if (start < end)
 			goto next;
+		else
+			end = start - 1;
 	}
 	mutex_unlock(&dirty_i->seglist_lock);
 

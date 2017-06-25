@@ -362,7 +362,7 @@ mode_fixup(struct drm_atomic_state *state)
 	struct drm_connector *connector;
 	struct drm_connector_state *conn_state;
 	int i;
-	bool ret;
+	int ret;
 
 	for_each_crtc_in_state(state, crtc, crtc_state, i) {
 		if (!crtc_state->mode_changed &&
@@ -1259,8 +1259,10 @@ int drm_atomic_helper_commit(struct drm_device *dev,
 
 	if (!nonblock) {
 		ret = drm_atomic_helper_wait_for_fences(dev, state, true);
-		if (ret)
+		if (ret) {
+			drm_atomic_helper_cleanup_planes(dev, state);
 			return ret;
+		}
 	}
 
 	/*
@@ -1387,6 +1389,15 @@ static int stall_checks(struct drm_crtc *crtc, bool nonblock)
 	return ret < 0 ? ret : 0;
 }
 
+void release_crtc_commit(struct completion *completion)
+{
+	struct drm_crtc_commit *commit = container_of(completion,
+						      typeof(*commit),
+						      flip_done);
+
+	drm_crtc_commit_put(commit);
+}
+
 /**
  * drm_atomic_helper_setup_commit - setup possibly nonblocking commit
  * @state: new modeset state to be committed
@@ -1479,6 +1490,8 @@ int drm_atomic_helper_setup_commit(struct drm_atomic_state *state,
 		}
 
 		crtc_state->event->base.completion = &commit->flip_done;
+		crtc_state->event->base.completion_release = release_crtc_commit;
+		drm_crtc_commit_get(commit);
 	}
 
 	return 0;
@@ -1664,9 +1677,6 @@ int drm_atomic_helper_prepare_planes(struct drm_device *dev,
 
 		funcs = plane->helper_private;
 
-		if (!drm_atomic_helper_framebuffer_changed(dev, state, plane_state->crtc))
-			continue;
-
 		if (funcs->prepare_fb) {
 			ret = funcs->prepare_fb(plane, plane_state);
 			if (ret)
@@ -1681,9 +1691,6 @@ fail:
 		const struct drm_plane_helper_funcs *funcs;
 
 		if (j >= i)
-			continue;
-
-		if (!drm_atomic_helper_framebuffer_changed(dev, state, plane_state->crtc))
 			continue;
 
 		funcs = plane->helper_private;
@@ -1951,9 +1958,6 @@ void drm_atomic_helper_cleanup_planes(struct drm_device *dev,
 
 	for_each_plane_in_state(old_state, plane, plane_state, i) {
 		const struct drm_plane_helper_funcs *funcs;
-
-		if (!drm_atomic_helper_framebuffer_changed(dev, old_state, plane_state->crtc))
-			continue;
 
 		funcs = plane->helper_private;
 

@@ -330,6 +330,7 @@ struct napi_struct {
 
 enum {
 	NAPI_STATE_SCHED,	/* Poll is scheduled */
+	NAPI_STATE_MISSED,	/* reschedule a napi */
 	NAPI_STATE_DISABLE,	/* Disable pending */
 	NAPI_STATE_NPSVC,	/* Netpoll - don't dequeue from poll_list */
 	NAPI_STATE_HASHED,	/* In NAPI hash (busy polling possible) */
@@ -338,12 +339,13 @@ enum {
 };
 
 enum {
-	NAPIF_STATE_SCHED	 = (1UL << NAPI_STATE_SCHED),
-	NAPIF_STATE_DISABLE	 = (1UL << NAPI_STATE_DISABLE),
-	NAPIF_STATE_NPSVC	 = (1UL << NAPI_STATE_NPSVC),
-	NAPIF_STATE_HASHED	 = (1UL << NAPI_STATE_HASHED),
-	NAPIF_STATE_NO_BUSY_POLL = (1UL << NAPI_STATE_NO_BUSY_POLL),
-	NAPIF_STATE_IN_BUSY_POLL = (1UL << NAPI_STATE_IN_BUSY_POLL),
+	NAPIF_STATE_SCHED	 = BIT(NAPI_STATE_SCHED),
+	NAPIF_STATE_MISSED	 = BIT(NAPI_STATE_MISSED),
+	NAPIF_STATE_DISABLE	 = BIT(NAPI_STATE_DISABLE),
+	NAPIF_STATE_NPSVC	 = BIT(NAPI_STATE_NPSVC),
+	NAPIF_STATE_HASHED	 = BIT(NAPI_STATE_HASHED),
+	NAPIF_STATE_NO_BUSY_POLL = BIT(NAPI_STATE_NO_BUSY_POLL),
+	NAPIF_STATE_IN_BUSY_POLL = BIT(NAPI_STATE_IN_BUSY_POLL),
 };
 
 enum gro_result {
@@ -413,20 +415,7 @@ static inline bool napi_disable_pending(struct napi_struct *n)
 	return test_bit(NAPI_STATE_DISABLE, &n->state);
 }
 
-/**
- *	napi_schedule_prep - check if NAPI can be scheduled
- *	@n: NAPI context
- *
- * Test if NAPI routine is already running, and if not mark
- * it as running.  This is used as a condition variable to
- * insure only one NAPI poll instance runs.  We also make
- * sure there is no pending NAPI disable.
- */
-static inline bool napi_schedule_prep(struct napi_struct *n)
-{
-	return !napi_disable_pending(n) &&
-		!test_and_set_bit(NAPI_STATE_SCHED, &n->state);
-}
+bool napi_schedule_prep(struct napi_struct *n);
 
 /**
  *	napi_schedule - schedule NAPI poll
@@ -866,11 +855,15 @@ struct netdev_xdp {
  *	of useless work if you return NETDEV_TX_BUSY.
  *	Required; cannot be NULL.
  *
- * netdev_features_t (*ndo_fix_features)(struct net_device *dev,
- *		netdev_features_t features);
- *	Adjusts the requested feature flags according to device-specific
- *	constraints, and returns the resulting flags. Must not modify
- *	the device state.
+ * netdev_features_t (*ndo_features_check)(struct sk_buff *skb,
+ *					   struct net_device *dev
+ *					   netdev_features_t features);
+ *	Called by core transmit path to determine if device is capable of
+ *	performing offload operations on a given packet. This is to give
+ *	the device an opportunity to implement any restrictions that cannot
+ *	be otherwise expressed by feature flags. The check is called with
+ *	the set of features that the stack has calculated and it returns
+ *	those the driver believes to be appropriate.
  *
  * u16 (*ndo_select_queue)(struct net_device *dev, struct sk_buff *skb,
  *                         void *accel_priv, select_queue_fallback_t fallback);
@@ -1028,6 +1021,12 @@ struct netdev_xdp {
  *	Called to release previously enslaved netdev.
  *
  *      Feature/offload setting functions.
+ * netdev_features_t (*ndo_fix_features)(struct net_device *dev,
+ *		netdev_features_t features);
+ *	Adjusts the requested feature flags according to device-specific
+ *	constraints, and returns the resulting flags. Must not modify
+ *	the device state.
+ *
  * int (*ndo_set_features)(struct net_device *dev, netdev_features_t features);
  *	Called to update device configuration to new features. Passed
  *	feature set might be less than what was returned by ndo_fix_features()).
@@ -1100,15 +1099,6 @@ struct netdev_xdp {
  *	Callback to use for xmit over the accelerated station. This
  *	is used in place of ndo_start_xmit on accelerated net
  *	devices.
- * netdev_features_t (*ndo_features_check)(struct sk_buff *skb,
- *					   struct net_device *dev
- *					   netdev_features_t features);
- *	Called by core transmit path to determine if device is capable of
- *	performing offload operations on a given packet. This is to give
- *	the device an opportunity to implement any restrictions that cannot
- *	be otherwise expressed by feature flags. The check is called with
- *	the set of features that the stack has calculated and it returns
- *	those the driver believes to be appropriate.
  * int (*ndo_set_tx_maxrate)(struct net_device *dev,
  *			     int queue_index, u32 maxrate);
  *	Called when a user wants to set a max-rate limitation of specific
@@ -1510,6 +1500,7 @@ enum netdev_priv_flags {
  *	@max_mtu:	Interface Maximum MTU value
  *	@type:		Interface hardware type
  *	@hard_header_len: Maximum hardware header length.
+ *	@min_header_len:  Minimum hardware header length
  *
  *	@needed_headroom: Extra headroom the hardware may need, but not in all
  *			  cases can this be guaranteed
@@ -1727,6 +1718,7 @@ struct net_device {
 	unsigned int		max_mtu;
 	unsigned short		type;
 	unsigned short		hard_header_len;
+	unsigned short		min_header_len;
 
 	unsigned short		needed_headroom;
 	unsigned short		needed_tailroom;
@@ -2477,14 +2469,19 @@ static inline int skb_gro_header_hard(struct sk_buff *skb, unsigned int hlen)
 	return NAPI_GRO_CB(skb)->frag0_len < hlen;
 }
 
+static inline void skb_gro_frag0_invalidate(struct sk_buff *skb)
+{
+	NAPI_GRO_CB(skb)->frag0 = NULL;
+	NAPI_GRO_CB(skb)->frag0_len = 0;
+}
+
 static inline void *skb_gro_header_slow(struct sk_buff *skb, unsigned int hlen,
 					unsigned int offset)
 {
 	if (!pskb_may_pull(skb, hlen))
 		return NULL;
 
-	NAPI_GRO_CB(skb)->frag0 = NULL;
-	NAPI_GRO_CB(skb)->frag0_len = 0;
+	skb_gro_frag0_invalidate(skb);
 	return skb->data + offset;
 }
 
@@ -2688,6 +2685,8 @@ static inline bool dev_validate_header(const struct net_device *dev,
 {
 	if (likely(len >= dev->hard_header_len))
 		return true;
+	if (len < dev->min_header_len)
+		return false;
 
 	if (capable(CAP_SYS_RAWIO)) {
 		memset(ll_header + len, 0, dev->hard_header_len - len);

@@ -263,7 +263,9 @@ static netdev_tx_t vrf_process_v4_outbound(struct sk_buff *skb,
 		.flowi4_iif = LOOPBACK_IFINDEX,
 		.flowi4_tos = RT_TOS(ip4h->tos),
 		.flowi4_flags = FLOWI_FLAG_ANYSRC | FLOWI_FLAG_SKIP_NH_OIF,
+		.flowi4_proto = ip4h->protocol,
 		.daddr = ip4h->daddr,
+		.saddr = ip4h->saddr,
 	};
 	struct net *net = dev_net(vrf_dev);
 	struct rtable *rt;
@@ -339,6 +341,7 @@ static netdev_tx_t is_ip_tx_frame(struct sk_buff *skb, struct net_device *dev)
 
 static netdev_tx_t vrf_xmit(struct sk_buff *skb, struct net_device *dev)
 {
+	int len = skb->len;
 	netdev_tx_t ret = is_ip_tx_frame(skb, dev);
 
 	if (likely(ret == NET_XMIT_SUCCESS || ret == NET_XMIT_CN)) {
@@ -346,7 +349,7 @@ static netdev_tx_t vrf_xmit(struct sk_buff *skb, struct net_device *dev)
 
 		u64_stats_update_begin(&dstats->syncp);
 		dstats->tx_pkts++;
-		dstats->tx_bytes += skb->len;
+		dstats->tx_bytes += len;
 		u64_stats_update_end(&dstats->syncp);
 	} else {
 		this_cpu_inc(dev->dstats->tx_drps);
@@ -459,8 +462,10 @@ static void vrf_rt6_release(struct net_device *dev, struct net_vrf *vrf)
 	}
 
 	if (rt6_local) {
-		if (rt6_local->rt6i_idev)
+		if (rt6_local->rt6i_idev) {
 			in6_dev_put(rt6_local->rt6i_idev);
+			rt6_local->rt6i_idev = NULL;
+		}
 
 		dst = &rt6_local->dst;
 		dev_put(dst->dev);
@@ -1121,7 +1126,7 @@ static int vrf_fib_rule(const struct net_device *dev, __u8 family, bool add_it)
 		goto nla_put_failure;
 
 	/* rule only needs to appear once */
-	nlh->nlmsg_flags &= NLM_F_EXCL;
+	nlh->nlmsg_flags |= NLM_F_EXCL;
 
 	frh = nlmsg_data(nlh);
 	memset(frh, 0, sizeof(*frh));
@@ -1250,6 +1255,8 @@ static int vrf_newlink(struct net *src_net, struct net_device *dev,
 		return -EINVAL;
 
 	vrf->tb_id = nla_get_u32(data[IFLA_VRF_TABLE]);
+	if (vrf->tb_id == RT_TABLE_UNSPEC)
+		return -EINVAL;
 
 	dev->priv_flags |= IFF_L3MDEV_MASTER;
 

@@ -1534,18 +1534,18 @@ static int crypt_set_keyring_key(struct crypt_config *cc, const char *key_string
 		return PTR_ERR(key);
 	}
 
-	rcu_read_lock();
+	down_read(&key->sem);
 
 	ukp = user_key_payload(key);
 	if (!ukp) {
-		rcu_read_unlock();
+		up_read(&key->sem);
 		key_put(key);
 		kzfree(new_key_string);
 		return -EKEYREVOKED;
 	}
 
 	if (cc->key_size != ukp->datalen) {
-		rcu_read_unlock();
+		up_read(&key->sem);
 		key_put(key);
 		kzfree(new_key_string);
 		return -EINVAL;
@@ -1553,7 +1553,7 @@ static int crypt_set_keyring_key(struct crypt_config *cc, const char *key_string
 
 	memcpy(cc->key, ukp->data, cc->key_size);
 
-	rcu_read_unlock();
+	up_read(&key->sem);
 	key_put(key);
 
 	/* clear the flag since following operations may invalidate previously valid key */
@@ -1649,12 +1649,16 @@ out:
 
 static int crypt_wipe_key(struct crypt_config *cc)
 {
+	int r;
+
 	clear_bit(DM_CRYPT_KEY_VALID, &cc->flags);
-	memset(&cc->key, 0, cc->key_size * sizeof(u8));
+	get_random_bytes(&cc->key, cc->key_size);
 	kzfree(cc->key_string);
 	cc->key_string = NULL;
+	r = crypt_setkey(cc);
+	memset(&cc->key, 0, cc->key_size * sizeof(u8));
 
-	return crypt_setkey(cc);
+	return r;
 }
 
 static void crypt_dtr(struct dm_target *ti)

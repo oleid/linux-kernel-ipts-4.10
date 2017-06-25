@@ -54,6 +54,8 @@
 
 static DEFINE_MUTEX(mce_chrdev_read_mutex);
 
+static int mce_chrdev_open_count;	/* #times opened */
+
 #define mce_log_get_idx_check(p) \
 ({ \
 	RCU_LOCKDEP_WARN(!rcu_read_lock_sched_held() && \
@@ -121,7 +123,7 @@ static void (*quirk_no_way_out)(int bank, struct mce *m, struct pt_regs *regs);
  * CPU/chipset specific EDAC code can register a notifier call here to print
  * MCE errors in a human-readable form.
  */
-ATOMIC_NOTIFIER_HEAD(x86_mce_decoder_chain);
+BLOCKING_NOTIFIER_HEAD(x86_mce_decoder_chain);
 
 /* Do initial initialization of a struct mce */
 void mce_setup(struct mce *m)
@@ -221,7 +223,7 @@ void mce_register_decode_chain(struct notifier_block *nb)
 	if (nb != &mce_srao_nb && nb->priority == INT_MAX)
 		nb->priority -= 1;
 
-	atomic_notifier_chain_register(&x86_mce_decoder_chain, nb);
+	blocking_notifier_chain_register(&x86_mce_decoder_chain, nb);
 }
 EXPORT_SYMBOL_GPL(mce_register_decode_chain);
 
@@ -229,7 +231,7 @@ void mce_unregister_decode_chain(struct notifier_block *nb)
 {
 	atomic_dec(&num_notifiers);
 
-	atomic_notifier_chain_unregister(&x86_mce_decoder_chain, nb);
+	blocking_notifier_chain_unregister(&x86_mce_decoder_chain, nb);
 }
 EXPORT_SYMBOL_GPL(mce_unregister_decode_chain);
 
@@ -322,18 +324,7 @@ static void __print_mce(struct mce *m)
 
 static void print_mce(struct mce *m)
 {
-	int ret = 0;
-
 	__print_mce(m);
-
-	/*
-	 * Print out human-readable details about the MCE error,
-	 * (if the CPU has an implementation for that)
-	 */
-	ret = atomic_notifier_call_chain(&x86_mce_decoder_chain, 0, m);
-	if (ret == NOTIFY_STOP)
-		return;
-
 	pr_emerg_ratelimited(HW_ERR "Run the above through 'mcelog --ascii'\n");
 }
 
@@ -599,6 +590,10 @@ static int mce_default_notifier(struct notifier_block *nb, unsigned long val,
 	 * notifier and us registered.
 	 */
 	if (atomic_read(&num_notifiers) > 2)
+		return NOTIFY_DONE;
+
+	/* Don't print when mcelog is running */
+	if (mce_chrdev_open_count > 0)
 		return NOTIFY_DONE;
 
 	__print_mce(m);
@@ -1373,20 +1368,15 @@ static unsigned long mce_adjust_timer_default(unsigned long interval)
 
 static unsigned long (*mce_adjust_timer)(unsigned long interval) = mce_adjust_timer_default;
 
-static void __restart_timer(struct timer_list *t, unsigned long interval)
+static void __start_timer(struct timer_list *t, unsigned long interval)
 {
 	unsigned long when = jiffies + interval;
 	unsigned long flags;
 
 	local_irq_save(flags);
 
-	if (timer_pending(t)) {
-		if (time_before(when, t->expires))
-			mod_timer(t, when);
-	} else {
-		t->expires = round_jiffies(when);
-		add_timer_on(t, smp_processor_id());
-	}
+	if (!timer_pending(t) || time_before(when, t->expires))
+		mod_timer(t, round_jiffies(when));
 
 	local_irq_restore(flags);
 }
@@ -1421,7 +1411,7 @@ static void mce_timer_fn(unsigned long data)
 
 done:
 	__this_cpu_write(mce_next_interval, iv);
-	__restart_timer(t, iv);
+	__start_timer(t, iv);
 }
 
 /*
@@ -1432,7 +1422,7 @@ void mce_timer_kick(unsigned long interval)
 	struct timer_list *t = this_cpu_ptr(&mce_timer);
 	unsigned long iv = __this_cpu_read(mce_next_interval);
 
-	__restart_timer(t, interval);
+	__start_timer(t, interval);
 
 	if (interval < iv)
 		__this_cpu_write(mce_next_interval, interval);
@@ -1779,17 +1769,15 @@ static void __mcheck_cpu_clear_vendor(struct cpuinfo_x86 *c)
 	}
 }
 
-static void mce_start_timer(unsigned int cpu, struct timer_list *t)
+static void mce_start_timer(struct timer_list *t)
 {
 	unsigned long iv = check_interval * HZ;
 
 	if (mca_cfg.ignore_ce || !iv)
 		return;
 
-	per_cpu(mce_next_interval, cpu) = iv;
-
-	t->expires = round_jiffies(jiffies + iv);
-	add_timer_on(t, cpu);
+	this_cpu_write(mce_next_interval, iv);
+	__start_timer(t, iv);
 }
 
 static void __mcheck_cpu_setup_timer(void)
@@ -1806,7 +1794,7 @@ static void __mcheck_cpu_init_timer(void)
 	unsigned int cpu = smp_processor_id();
 
 	setup_pinned_timer(t, mce_timer_fn, cpu);
-	mce_start_timer(cpu, t);
+	mce_start_timer(t);
 }
 
 /* Handle unconfigured int18 (should never happen) */
@@ -1878,7 +1866,6 @@ void mcheck_cpu_clear(struct cpuinfo_x86 *c)
  */
 
 static DEFINE_SPINLOCK(mce_chrdev_state_lock);
-static int mce_chrdev_open_count;	/* #times opened */
 static int mce_chrdev_open_exclu;	/* already open exclusive? */
 
 static int mce_chrdev_open(struct inode *inode, struct file *file)
@@ -2566,7 +2553,7 @@ static int mce_cpu_dead(unsigned int cpu)
 
 static int mce_cpu_online(unsigned int cpu)
 {
-	struct timer_list *t = &per_cpu(mce_timer, cpu);
+	struct timer_list *t = this_cpu_ptr(&mce_timer);
 	int ret;
 
 	mce_device_create(cpu);
@@ -2577,13 +2564,13 @@ static int mce_cpu_online(unsigned int cpu)
 		return ret;
 	}
 	mce_reenable_cpu();
-	mce_start_timer(cpu, t);
+	mce_start_timer(t);
 	return 0;
 }
 
 static int mce_cpu_pre_down(unsigned int cpu)
 {
-	struct timer_list *t = &per_cpu(mce_timer, cpu);
+	struct timer_list *t = this_cpu_ptr(&mce_timer);
 
 	mce_disable_cpu();
 	del_timer_sync(t);
